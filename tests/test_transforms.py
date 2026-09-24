@@ -1,6 +1,7 @@
 import unittest
 
 from sqlglot import parse_one, expressions as exp
+from sqlglot.errors import UnsupportedError
 from sqlglot.transforms import (
     eliminate_distinct_on,
     eliminate_join_marks,
@@ -8,6 +9,7 @@ from sqlglot.transforms import (
     eliminate_semi_and_anti_joins,
     eliminate_window_clause,
     inherit_struct_field_names,
+    named_to_positional,
     remove_precision_parameterized_types,
     remove_unique_constraints,
 )
@@ -439,3 +441,145 @@ class TestTransforms(unittest.TestCase):
             ),
             "SELECT ARRAY(STRUCT('Alice' AS name, 85), STRUCT('Bob', 92))",
         )
+
+    def test_named_to_positional(self):
+        signatures = {
+            "f": ["a", ("b", exp.maybe_parse("1")), ("c", exp.maybe_parse("'x'"))],
+        }
+
+        def convert(sql, sigs=signatures, dialect=None):
+            return named_to_positional(parse_one(sql, dialect=dialect), sigs, dialect=dialect).sql(
+                dialect=dialect
+            )
+
+        # Middle omitted parameters are filled with their defaults
+        self.assertEqual(convert("SELECT f(a => 10, c => 30)"), "SELECT F(10, 1, 30)")
+
+        # Trailing omitted parameters are dropped, named arguments are reordered
+        self.assertEqual(convert("SELECT f(c => 3, a => 1)"), "SELECT F(1, 1, 3)")
+        self.assertEqual(convert("SELECT f(a => 1)"), "SELECT F(1)")
+
+        # Positional and named arguments can be mixed
+        self.assertEqual(convert("SELECT f(1, c => 2)"), "SELECT F(1, 1, 2)")
+
+        # Unregistered functions are left untouched
+        self.assertEqual(convert("SELECT g(a => 1)"), "SELECT G(a => 1)")
+
+        # Nested calls are converted recursively
+        self.assertEqual(convert("SELECT f(a => f(c => 2, a => 1))"), "SELECT F(F(1, 1, 2))")
+
+        # The original AST is not modified
+        original = parse_one("SELECT f(a => 1)")
+        named_to_positional(original, signatures)
+        self.assertEqual(original.sql(), "SELECT F(a => 1)")
+
+    def test_named_to_positional_qualified_names(self):
+        signatures = {
+            "s1.g": ["x"],
+            "s2.g": ["x", "y"],
+        }
+
+        # Same function name in different schemas resolves to different signatures
+        self.assertEqual(
+            named_to_positional(
+                parse_one("SELECT s1.g(x => 2), s2.g(y => 1, x => 2)"), signatures
+            ).sql(),
+            "SELECT s1.g(2), s2.g(2, 1)",
+        )
+
+        # Function and parameter names are normalized according to the dialect
+        self.assertEqual(
+            named_to_positional(
+                parse_one("SELECT S1.G(X => 1)", dialect="snowflake"),
+                signatures,
+                dialect="snowflake",
+            ).sql(dialect="snowflake"),
+            "SELECT S1.G(1)",
+        )
+        # Quoted identifiers are matched case-sensitively, per the dialect's rules
+        self.assertEqual(
+            named_to_positional(
+                parse_one('SELECT "S1"."G"("X" => 1)', dialect="snowflake"),
+                signatures,
+                dialect="snowflake",
+            ).sql(dialect="snowflake"),
+            'SELECT "S1"."G"(1)',
+        )
+
+    def test_named_to_positional_errors(self):
+        signatures = {"f": ["a", ("b", exp.maybe_parse("1"))]}
+
+        def convert(sql):
+            return named_to_positional(parse_one(sql), signatures)
+
+        with self.assertRaisesRegex(ValueError, "Unknown parameter"):
+            convert("SELECT f(z => 1)")
+
+        with self.assertRaisesRegex(ValueError, "Duplicate parameter"):
+            convert("SELECT f(a => 1, a => 2)")
+
+        with self.assertRaisesRegex(ValueError, "already provided as a positional"):
+            convert("SELECT f(1, a => 2)")
+
+        with self.assertRaisesRegex(ValueError, "Positional argument follows"):
+            convert("SELECT f(b => 1, 2)")
+
+        with self.assertRaisesRegex(ValueError, "Too many arguments"):
+            convert("SELECT f(1, 2, 3, b => 4)")
+
+        with self.assertRaisesRegex(ValueError, "is required"):
+            convert("SELECT f(b => 1)")
+
+    def test_named_to_positional_volatile(self):
+        signatures = {
+            "f": ["a", "b"],
+            "g": ["a", ("b", exp.maybe_parse("nextval('s')"))],
+        }
+
+        # Reordering volatile arguments is rejected
+        for sql in (
+            "SELECT f(b => RAND(), a => 1)",
+            "SELECT f(b => 1, a => uuid())",
+        ):
+            with self.subTest(sql):
+                with self.assertRaises(UnsupportedError):
+                    named_to_positional(parse_one(sql), signatures)
+
+        with self.assertRaises(UnsupportedError):
+            named_to_positional(
+                parse_one("SELECT f(b => 1, a => NEXT VALUE FOR s)", dialect="tsql"),
+                signatures,
+                dialect="tsql",
+            )
+
+        # Volatile arguments that don't need reordering are allowed
+        self.assertEqual(
+            named_to_positional(
+                parse_one("SELECT f(a => RAND(), b => 1)"), signatures
+            ).sql(),
+            "SELECT F(RAND(), 1)",
+        )
+
+        # Additional volatile function names can be registered by the caller
+        with self.assertRaises(UnsupportedError):
+            named_to_positional(
+                parse_one("SELECT f(b => 1, a => my_side_effect_fn())"),
+                signatures,
+                volatile_functions={"my_side_effect_fn"},
+            )
+
+    def test_named_to_positional_defaults_not_shared(self):
+        default = exp.maybe_parse("ARRAY[1]")
+        signatures = {"f": [("a", default), "b"]}
+
+        first = named_to_positional(parse_one("SELECT f(b => 1)"), signatures)
+        second = named_to_positional(parse_one("SELECT f(b => 2)"), signatures)
+
+        first_array = first.find(exp.Array)
+        self.assertIsNot(first_array, second.find(exp.Array))
+        self.assertIsNot(first_array, default)
+
+        # Mutating one output doesn't affect the other output or the registered default
+        first_array.expressions.append(exp.Literal.number(2))
+        self.assertEqual(second.sql(), "SELECT F(ARRAY(1), 2)")
+        self.assertEqual(default.sql(), "ARRAY(1)")

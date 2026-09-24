@@ -9,6 +9,7 @@ from sqlglot.helper import find_new_name, name_sequence, seq_get
 
 if t.TYPE_CHECKING:
     from sqlglot._typing import E
+    from sqlglot.dialects.dialect import Dialect, DialectType
     from sqlglot.generator import Generator
 
 
@@ -1126,3 +1127,207 @@ def inherit_struct_field_names(expression: exp.Expr) -> exp.Expr:
             struct.set("expressions", new_expressions)
 
     return expression
+
+
+# Function names that are considered volatile: they may return different results across
+# evaluations (e.g. random generators) or have side effects (e.g. sequence advancement).
+VOLATILE_FUNCTION_NAMES = {
+    "currval",
+    "gen_random_uuid",
+    "newid",
+    "nextval",
+    "rand",
+    "random",
+    "randn",
+    "randstr",
+    "random_uuid",
+    "uniq",
+    "uuid",
+    "uuid_string",
+}
+
+VOLATILE_EXPRESSION_TYPES = (exp.Rand, exp.Randn, exp.Randstr, exp.NextValueFor)
+
+
+def named_to_positional(
+    expression: exp.Expr,
+    signatures: dict[str, list[str | tuple[str, exp.Expr | None]]],
+    dialect: DialectType = None,
+    volatile_functions: t.Collection[str] | None = None,
+) -> exp.Expr:
+    """
+    Rewrites named-argument calls (``f(name => value)``) of registered UDFs into positional
+    calls, so that the result can be generated for dialects that only support positional
+    arguments. The input AST is not modified.
+
+    Args:
+        expression: the expression to transform.
+        signatures: maps a (possibly qualified, e.g. "schema.func") function name to its
+            ordered parameters. Each parameter is either a name string (required) or a
+            (name, default) tuple, where a None default also marks the parameter as required.
+            Names are matched as unquoted identifiers using the dialect's normalization rules.
+        dialect: the dialect used to normalize function and parameter names.
+        volatile_functions: additional function names to treat as volatile, extending
+            VOLATILE_FUNCTION_NAMES.
+
+    Returns:
+        The transformed expression.
+
+    Raises:
+        ValueError: if a call uses an unknown or duplicate parameter name, mixes positional
+            and named arguments for the same parameter, or omits a required parameter.
+        UnsupportedError: if converting a call would reorder volatile (e.g. random or
+            sequence) arguments, potentially changing the evaluation semantics.
+    """
+    from sqlglot.dialects.dialect import Dialect
+
+    dialect_obj = Dialect.get_or_raise(dialect)
+    volatile_names = VOLATILE_FUNCTION_NAMES | {n.lower() for n in volatile_functions or ()}
+
+    registry: dict[tuple[str, ...], list[tuple[str, exp.Expr | None]]] = {}
+    for name, params in signatures.items():
+        key = tuple(_normalize_name(part, dialect_obj) for part in name.split("."))
+        registry[key] = [
+            (_normalize_name(p, dialect_obj), None)
+            if isinstance(p, str)
+            else (_normalize_name(p[0], dialect_obj), p[1])
+            for p in params
+        ]
+
+    if not registry:
+        return expression
+
+    result = expression.copy()
+
+    for func in list(result.find_all(exp.Anonymous)):
+        args = func.expressions
+        if not any(isinstance(arg, exp.Kwarg) for arg in args):
+            continue
+
+        parts = _qualified_name_parts(func, dialect_obj)
+        signature = registry.get(tuple(parts))
+        if signature is None and len(parts) > 1:
+            signature = registry.get((parts[-1],))
+        if signature is None:
+            continue
+
+        func.set(
+            "expressions",
+            _positional_args(func, signature, dialect_obj, volatile_names),
+        )
+
+    return result
+
+
+def _normalize_name(name: str, dialect: Dialect) -> str:
+    return dialect.normalize_identifier(exp.Identifier(this=name, quoted=False)).name
+
+
+def _qualified_name_parts(func: exp.Anonymous, dialect: Dialect) -> list[str]:
+    parts = []
+
+    parent = func.parent
+    if isinstance(parent, exp.Dot) and parent.expression is func:
+        qualifier: exp.Expr | None = parent.this
+        while isinstance(qualifier, exp.Dot):
+            parts.append(qualifier.expression)
+            qualifier = qualifier.this
+        if qualifier:
+            parts.append(qualifier)
+        parts.reverse()
+
+    parts.append(func.this)
+
+    normalized = []
+    for part in parts:
+        if isinstance(part, exp.Identifier):
+            identifier = exp.Identifier(this=part.this, quoted=part.quoted)
+        else:
+            identifier = exp.Identifier(this=str(part), quoted=False)
+        normalized.append(dialect.normalize_identifier(identifier).name)
+
+    return normalized
+
+
+def _positional_args(
+    func: exp.Anonymous,
+    signature: list[tuple[str, exp.Expr | None]],
+    dialect: Dialect,
+    volatile_names: set[str],
+) -> list[exp.Expr]:
+    name = func.name
+    params = [param for param, _ in signature]
+    defaults = dict(signature)
+
+    slots: list[exp.Expr | None] = [None] * len(params)
+    provided: list[exp.Expr] = []
+    seen: set[str] = set()
+    num_positional = 0
+
+    for arg in func.expressions:
+        if isinstance(arg, exp.Kwarg):
+            param = _normalize_name(arg.this.name, dialect)
+            if param not in defaults:
+                raise ValueError(f"Unknown parameter '{arg.this.name}' for function {name}")
+            if param in seen:
+                raise ValueError(f"Duplicate parameter '{arg.this.name}' for function {name}")
+
+            index = params.index(param)
+            if index < num_positional:
+                raise ValueError(
+                    f"Parameter '{arg.this.name}' of function {name} was already "
+                    "provided as a positional argument"
+                )
+
+            seen.add(param)
+            slots[index] = arg.expression
+            provided.append(arg.expression)
+        else:
+            if seen:
+                raise ValueError(
+                    f"Positional argument follows a named argument in function {name}"
+                )
+            if num_positional >= len(params):
+                raise ValueError(f"Too many arguments for function {name}")
+
+            slots[num_positional] = arg
+            provided.append(arg)
+            num_positional += 1
+
+    last_provided = max((i for i, slot in enumerate(slots) if slot is not None), default=-1)
+
+    ordered = [slot for slot in slots[: last_provided + 1] if slot is not None]
+    if any(original is not reordered for original, reordered in zip(provided, ordered)) and any(
+        _contains_volatile(arg, volatile_names) for arg in provided
+    ):
+        raise UnsupportedError(
+            f"Cannot convert named arguments of function {name} to positional ones: "
+            "reordering volatile arguments may change the evaluation semantics"
+        )
+
+    positional = []
+    for i in range(last_provided + 1):
+        slot = slots[i]
+        if slot is None:
+            default = defaults[params[i]]
+            if default is None:
+                raise ValueError(
+                    f"Parameter '{params[i]}' of function {name} is required, "
+                    "register a default expression to allow omitting it"
+                )
+            slot = default.copy()
+        positional.append(slot)
+
+    return positional
+
+
+def _contains_volatile(expression: exp.Expr, volatile_names: set[str]) -> bool:
+    for func in expression.find_all(exp.Func):
+        if isinstance(func, VOLATILE_EXPRESSION_TYPES):
+            return True
+
+        name = func.name if isinstance(func, exp.Anonymous) else func.sql_name()
+        if name.lower() in volatile_names:
+            return True
+
+    return False
