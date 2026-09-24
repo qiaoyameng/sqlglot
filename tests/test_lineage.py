@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 import sqlglot
-from sqlglot.lineage import lineage
+from sqlglot.lineage import ControlEdge, lineage
 from sqlglot.schema import MappingSchema
 
 
@@ -1299,3 +1299,155 @@ class TestLineage(unittest.TestCase):
                 seen.add(id(node))
         for nid in seen:
             self.assertEqual(counts.get(nid, 0), 1)
+
+    def test_control_dependencies_value_vs_control(self) -> None:
+        # a feeds the output value, b only decides whether the row appears
+        node = lineage(
+            "a",
+            "SELECT a FROM t WHERE b > 0",
+            schema={"t": {"a": "int", "b": "int"}},
+            include_control=True,
+        )
+        self.assertEqual([d.name for d in node.downstream], ["t.a"])
+        self.assertEqual([(e.kind, e.node.name) for e in node.control], [("where", "t.b")])
+
+        # Default behavior is unchanged: no control edges, same value lineage
+        default = lineage("a", "SELECT a FROM t WHERE b > 0", schema={"t": {"a": "int"}})
+        self.assertEqual(default.control, [])
+        self.assertEqual([d.name for d in default.downstream], ["t.a"])
+
+    def test_control_dependencies_clause_kinds(self) -> None:
+        node = lineage(
+            "s",
+            "SELECT SUM(v) AS s FROM t GROUP BY g HAVING SUM(v) > 10",
+            schema={"t": {"v": "int", "g": "int"}},
+            include_control=True,
+        )
+        self.assertEqual([d.name for d in node.downstream], ["t.v"])
+        kinds = {e.kind: e.node.name for e in node.control}
+        self.assertEqual(kinds, {"group": "t.g", "having": "t.v"})
+
+        node = lineage(
+            "a",
+            "SELECT t.a FROM t JOIN s ON t.id = s.id",
+            schema={"t": {"a": "int", "id": "int"}, "s": {"id": "int"}},
+            include_control=True,
+        )
+        self.assertEqual(
+            [(e.kind, e.node.name) for e in node.control],
+            [("join", "t.id"), ("join", "s.id")],
+        )
+
+        node = lineage(
+            "a",
+            "SELECT a FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) = 1",
+            schema={"t": {"a": "int", "g": "int", "v": "int"}},
+            dialect="snowflake",
+            include_control=True,
+        )
+        self.assertEqual({e.kind for e in node.control}, {"qualify"})
+        self.assertEqual({e.node.name for e in node.control}, {"T.G", "T.V"})
+
+    def test_control_dependencies_case(self) -> None:
+        # The CASE condition is a control edge; the branch value stays a value edge
+        node = lineage(
+            "x",
+            "SELECT CASE WHEN b > 0 THEN a ELSE 0 END AS x FROM t",
+            schema={"t": {"a": "int", "b": "int"}},
+            include_control=True,
+        )
+        self.assertEqual([d.name for d in node.downstream], ["t.a"])
+        self.assertEqual([(e.kind, e.node.name) for e in node.control], [("case", "t.b")])
+
+    def test_control_dependencies_through_cte_and_alias(self) -> None:
+        # The WHERE clause references the CTE output alias; it must trace through
+        # the CTE to the base column it was renamed from
+        node = lineage(
+            "a",
+            "WITH c AS (SELECT x AS a, y AS b FROM t) SELECT a FROM c WHERE b > 0",
+            schema={"t": {"x": "int", "y": "int"}},
+            include_control=True,
+        )
+        (where_edge,) = node.control
+        self.assertEqual(where_edge.kind, "where")
+        self.assertEqual(where_edge.node.name, "c.b")
+        self.assertEqual([d.name for d in where_edge.node.downstream], ["t.y"])
+
+    def test_control_dependencies_correlated_subquery(self) -> None:
+        # t.b is correlated and must resolve to the outer t; u.b belongs to the
+        # inner query. The same-named columns must not be conflated.
+        node = lineage(
+            "a",
+            "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.b = t.b)",
+            schema={"t": {"a": "int", "b": "int"}, "u": {"b": "int"}},
+            include_control=True,
+        )
+        edges = {(e.kind, e.node.name) for e in node.control}
+        self.assertIn(("where", "t.b"), edges)
+        self.assertNotIn(("where", "u.b"), edges)
+
+        (subquery_edge,) = [e for e in node.control if e.node.name.startswith("SELECT")]
+        self.assertEqual(
+            [(e.kind, e.node.name) for e in subquery_edge.node.control], [("where", "u.b")]
+        )
+        self.assertEqual(subquery_edge.node.control[0].node.source.sql(), "u AS u")
+
+    def test_control_dependencies_constant_output(self) -> None:
+        # A constant projection has no value dependencies but still has control ones
+        node = lineage(
+            "one",
+            "SELECT 1 AS one FROM t WHERE b > 0",
+            schema={"t": {"b": "int"}},
+            include_control=True,
+        )
+        self.assertEqual(node.downstream, [])
+        self.assertEqual([(e.kind, e.node.name) for e in node.control], [("where", "t.b")])
+
+    def test_control_dependencies_unresolvable_column(self) -> None:
+        # A column from a source that can't be resolved ends in a Placeholder leaf
+        node = lineage(
+            "a",
+            "SELECT a FROM t1 WHERE t2.b > 0",
+            schema={"t1": {"a": "int"}},
+            include_control=True,
+        )
+        (edge,) = node.control
+        self.assertEqual(edge.kind, "where")
+        self.assertEqual(edge.node.name, "t2.b")
+        self.assertIsInstance(edge.node.expression, sqlglot.exp.Placeholder)
+        self.assertIsInstance(edge.node.source, sqlglot.exp.Placeholder)
+
+    def test_control_dependencies_shared_nodes(self) -> None:
+        # Value and control edges converging on the same CTE column share one Node
+        result = lineage(
+            None,
+            "WITH c AS (SELECT x AS a, y AS b FROM t) SELECT a, b FROM c WHERE b > 0",
+            schema={"t": {"x": "int", "y": "int"}},
+            include_control=True,
+        )
+        b_via_value = result["b"].downstream[0]
+        (where_edge,) = result["a"].control
+        self.assertIs(where_edge.node, b_via_value)
+
+        # walk() dedupes shared nodes: each node in the DAG is yielded once
+        walked = list(result["a"].walk())
+        self.assertEqual(len(walked), len({id(n) for n in walked}))
+
+    def test_control_dependencies_walk_cycle(self) -> None:
+        # A cyclic graph (e.g. from a recursive CTE) must not hang walk()/to_html()
+        node = lineage(
+            "a",
+            "SELECT a FROM t WHERE b > 0",
+            schema={"t": {"a": "int", "b": "int"}},
+            include_control=True,
+        )
+        leaf = node.control[0].node
+        leaf.control.append(ControlEdge(node=node, kind="where"))
+
+        walked = list(node.walk())
+        self.assertEqual(len(walked), len({id(n) for n in walked}))
+        self.assertIn(leaf, walked)
+
+        html = node.to_html()
+        self.assertGreater(len(html._repr_html_()), 1000)
+        self.assertTrue(any(e.get("dashes") and e.get("label") == "where" for e in html.edges))

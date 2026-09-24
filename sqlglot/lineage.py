@@ -20,12 +20,31 @@ if t.TYPE_CHECKING:
 logger = logging.getLogger("sqlglot")
 
 
+# Edge kinds used for control dependencies, i.e. columns that don't feed an output's
+# value but determine whether a row appears in the result at all.
+CONTROL_EDGE_KINDS = ("where", "join", "having", "qualify", "group", "case")
+
+
+@dataclass(frozen=True)
+class ControlEdge:
+    """An edge from a node to a column that controls whether its rows appear.
+
+    Unlike `Node.downstream` (value dependencies: where the data comes from), a
+    control edge points at a column used to filter, group or conditionally produce
+    rows. `kind` is one of CONTROL_EDGE_KINDS.
+    """
+
+    node: Node
+    kind: str
+
+
 @dataclass(frozen=True)
 class Node:
     name: str
     expression: exp.Expr
     source: exp.Expr
     downstream: list[Node] = field(default_factory=list)
+    control: list[ControlEdge] = field(default_factory=list)
     source_name: str = ""
     reference_node_name: str = ""
 
@@ -43,6 +62,7 @@ class Node:
             visited.add(node_id)
             yield node
             queue.extend(reversed(node.downstream))
+            queue.extend(edge.node for edge in reversed(node.control))
 
     def to_html(self, dialect: DialectType = None, **opts: Unpack[GraphHTMLArgs]) -> GraphHTML:
         nodes = {}
@@ -75,6 +95,15 @@ class Node:
 
             for d in node.downstream:
                 edges.append({"from": node_id, "to": id(d)})
+            for edge in node.control:
+                edges.append(
+                    {
+                        "from": node_id,
+                        "to": id(edge.node),
+                        "label": edge.kind,
+                        "dashes": True,
+                    }
+                )
         return GraphHTML(nodes, edges, **opts)
 
 
@@ -95,6 +124,7 @@ def lineage(
     scope: Scope | None = None,
     trim_selects: bool = True,
     copy: bool = True,
+    include_control: bool = False,
     on_node: t.Callable[[Node], None] | None = None,
     **kwargs,
 ) -> Node | dict[str, Node]:
@@ -113,6 +143,9 @@ def lineage(
         scope: A pre-created scope to use instead.
         trim_selects: Whether to clean up selects by trimming to only relevant columns.
         copy: Whether to copy the Expr arguments.
+        include_control: Whether to also collect control dependencies (WHERE, JOIN ON,
+            HAVING, QUALIFY, GROUP BY and CASE conditions) into each Node's `control`
+            list. Off by default, so `downstream` keeps holding value dependencies only.
         on_node: Optional callback invoked for every Node created during the walk,
             after the Node's downstream is populated. Useful for injecting
             caller-managed data into Node.payload during the walk.
@@ -166,6 +199,7 @@ def lineage(
             dialect,
             trim_selects=trim_selects,
             schema=schema,
+            _include_control=include_control,
             _cache=cache,
             _scope_meta=scope_meta,
             on_node=on_node,
@@ -185,6 +219,7 @@ def lineage(
             dialect,
             trim_selects=trim_selects,
             schema=schema,
+            _include_control=include_control,
             _cache=cache,
             _scope_meta=scope_meta,
             on_node=on_node,
@@ -203,6 +238,7 @@ def to_node(
     reference_node_name: str | None = None,
     trim_selects: bool = True,
     schema: Schema | None = None,
+    _include_control: bool = False,
     _cache: dict[tuple, Node] | None = None,
     _scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] | None = None,
     on_node: t.Callable[[Node], None] | None = None,
@@ -255,6 +291,7 @@ def to_node(
                 reference_node_name=reference_node_name,
                 trim_selects=trim_selects,
                 schema=schema,
+                _include_control=_include_control,
                 _cache=_cache,
                 _scope_meta=_scope_meta,
                 on_node=on_node,
@@ -296,6 +333,7 @@ def to_node(
                 reference_node_name=reference_node_name,
                 trim_selects=trim_selects,
                 schema=schema,
+                _include_control=_include_control,
                 _cache=_cache,
                 _scope_meta=_scope_meta,
                 on_node=on_node,
@@ -346,6 +384,7 @@ def to_node(
                 upstream=node,
                 trim_selects=trim_selects,
                 schema=schema,
+                _include_control=_include_control,
                 _cache=_cache,
                 _scope_meta=_scope_meta,
                 on_node=on_node,
@@ -362,6 +401,19 @@ def to_node(
 
     # Find all columns that went into creating this one to list their lineage nodes.
     source_columns = set(find_all_in_scope(select, exp.Column))
+
+    # Columns in CASE conditions decide which branch produces the value rather than
+    # feeding the value itself, so they're tracked as control dependencies instead.
+    case_columns: list[exp.Column] = []
+    if _include_control:
+        for case in find_all_in_scope(select, exp.Case):
+            if case.this:
+                case_columns.extend(find_all_in_scope(case.this, exp.Column))
+            for if_ in case.args.get("ifs") or []:
+                case_columns.extend(find_all_in_scope(if_.this, exp.Column))
+        if case_columns:
+            case_column_ids = {id(c) for c in case_columns}
+            source_columns = {c for c in source_columns if id(c) not in case_column_ids}
 
     # If the source is a UDTF find columns used in the UDTF to generate the table
     if isinstance(source, exp.UDTF):
@@ -415,6 +467,7 @@ def to_node(
                 reference_node_name=reference_node_name,
                 trim_selects=trim_selects,
                 schema=schema,
+                _include_control=_include_control,
                 _cache=_cache,
                 _scope_meta=_scope_meta,
                 on_node=on_node,
@@ -463,6 +516,7 @@ def to_node(
                         reference_node_name=reference_node_name,
                         trim_selects=trim_selects,
                         schema=schema,
+                        _include_control=_include_control,
                         _cache=_cache,
                         _scope_meta=_scope_meta,
                         on_node=on_node,
@@ -488,6 +542,35 @@ def to_node(
             if on_node:
                 on_node(leaf)
 
+    if _include_control and isinstance(scope.expression, exp.Select):
+        for c in case_columns:
+            _add_control_edge(
+                node,
+                c,
+                "case",
+                scope,
+                source_names,
+                source_name,
+                dialect,
+                trim_selects,
+                schema,
+                _cache,
+                _scope_meta,
+                on_node,
+            )
+        _collect_control_dependencies(
+            node,
+            scope,
+            source_names,
+            source_name,
+            dialect,
+            trim_selects,
+            schema,
+            _cache,
+            _scope_meta,
+            on_node,
+        )
+
     if _cache is not None:
         _cache[cache_key] = node
 
@@ -495,6 +578,174 @@ def to_node(
         on_node(node)
 
     return node
+
+
+def _control_clauses(select: exp.Select) -> Iterator[tuple[str, exp.Expr]]:
+    """Yield (edge kind, clause expression) for each clause that filters or groups rows."""
+    where = select.args.get("where")
+    if where:
+        yield "where", where.this
+
+    for join in select.args.get("joins") or []:
+        on = join.args.get("on")
+        if on:
+            yield "join", on
+
+    having = select.args.get("having")
+    if having:
+        yield "having", having.this
+
+    qualify = select.args.get("qualify")
+    if qualify:
+        yield "qualify", qualify.this
+
+    group = select.args.get("group")
+    if group:
+        for grouping in group.expressions:
+            yield "group", grouping
+
+
+def _add_control_edge(
+    node: Node,
+    column: exp.Column,
+    kind: str,
+    scope: Scope,
+    source_names: dict[str, str],
+    source_name: str | None,
+    dialect: DialectType,
+    trim_selects: bool,
+    schema: Schema | None,
+    cache: dict[tuple, Node] | None,
+    scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] | None,
+    on_node: t.Callable[[Node], None] | None,
+) -> None:
+    """Resolve a control column against a scope and attach it as a typed control edge."""
+    table = column.table
+    col_source = scope.sources.get(table)
+
+    if isinstance(col_source, Scope):
+        reference_node_name = None
+        if col_source.scope_type == ScopeType.DERIVED_TABLE and table not in source_names:
+            reference_node_name = table
+        elif col_source.scope_type == ScopeType.CTE:
+            selected_node, _ = scope.selected_sources.get(table, (None, None))
+            reference_node_name = selected_node.name if selected_node else None
+
+        # Trace through the CTE / derived table to the column's real source, reusing
+        # the shared cache so control and value edges converge on the same nodes.
+        child = to_node(
+            column.name,
+            scope=col_source,
+            dialect=dialect,
+            scope_name=table,
+            source_name=source_names.get(table) or source_name,
+            reference_node_name=reference_node_name,
+            trim_selects=trim_selects,
+            schema=schema,
+            _include_control=True,
+            _cache=cache,
+            _scope_meta=scope_meta,
+            on_node=on_node,
+        )
+    else:
+        # A base table, or an unknown source (e.g. unresolvable without a schema):
+        # the lineage ends in a leaf, mirrored by a Placeholder when unknown.
+        col_expr = col_source or exp.Placeholder()
+        child = Node(name=column.sql(comments=False), source=col_expr, expression=col_expr)
+        if on_node:
+            on_node(child)
+
+    if not any(edge.node is child and edge.kind == kind for edge in node.control):
+        node.control.append(ControlEdge(node=child, kind=kind))
+
+
+def _collect_control_dependencies(
+    node: Node,
+    scope: Scope,
+    source_names: dict[str, str],
+    source_name: str | None,
+    dialect: DialectType,
+    trim_selects: bool,
+    schema: Schema | None,
+    cache: dict[tuple, Node] | None,
+    scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] | None,
+    on_node: t.Callable[[Node], None] | None,
+    _skip_external: bool = False,
+) -> None:
+    """Attach control edges for a Select scope's filtering / grouping clauses."""
+    expression = scope.expression
+    if not isinstance(expression, exp.Select):
+        return
+
+    subquery_scopes = {id(s.expression): s for s in scope.subquery_scopes}
+    external_column_ids = {id(c) for c in scope.external_columns} if _skip_external else set()
+
+    for kind, clause in _control_clauses(expression):
+        for column in find_all_in_scope(clause, exp.Column):
+            if id(column) in external_column_ids:
+                # Correlated column of a nested subquery: already resolved against
+                # the outer scope by the caller, so it never leaks onto a same-named
+                # column of an inner source.
+                continue
+            _add_control_edge(
+                node,
+                column,
+                kind,
+                scope,
+                source_names,
+                source_name,
+                dialect,
+                trim_selects,
+                schema,
+                cache,
+                scope_meta,
+                on_node,
+            )
+
+        for subquery in find_all_in_scope(clause, *exp.UNWRAPPED_QUERIES):
+            subquery_scope = subquery_scopes.get(id(subquery))
+            if not subquery_scope:
+                continue
+
+            # Correlated columns belong to this scope, not the subquery's
+            for external_column in subquery_scope.external_columns:
+                _add_control_edge(
+                    node,
+                    external_column,
+                    kind,
+                    scope,
+                    source_names,
+                    source_name,
+                    dialect,
+                    trim_selects,
+                    schema,
+                    cache,
+                    scope_meta,
+                    on_node,
+                )
+
+            subquery_node = Node(
+                name=subquery.sql(comments=False),
+                source=subquery,
+                expression=subquery,
+            )
+            node.control.append(ControlEdge(node=subquery_node, kind=kind))
+            if on_node:
+                on_node(subquery_node)
+
+            _collect_control_dependencies(
+                subquery_node,
+                subquery_scope,
+                source_names,
+                source_name,
+                dialect,
+                trim_selects,
+                schema,
+                cache,
+                scope_meta,
+                on_node,
+                _skip_external=True,
+            )
 
 
 def _pre_pivot_columns(pivot: exp.Pivot, scope: Scope, schema: Schema | None = None) -> list[str]:
