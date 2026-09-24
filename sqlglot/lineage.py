@@ -20,19 +20,41 @@ if t.TYPE_CHECKING:
 logger = logging.getLogger("sqlglot")
 
 
+class EdgeKind:
+    """Edge types for control dependencies: columns that decide whether a row
+    appears in the result (or which branch produces its value), as opposed to
+    columns that only contribute to the value itself."""
+
+    FILTER = "filter"  # WHERE
+    JOIN = "join"  # JOIN ... ON
+    HAVING = "having"  # HAVING
+    QUALIFY = "qualify"  # QUALIFY
+    GROUP = "group"  # GROUP BY
+    CASE = "case"  # CASE WHEN conditions
+
+
+@dataclass(frozen=True)
+class Edge:
+    """A typed control-dependency edge from a Node to one of its inputs."""
+
+    node: Node
+    kind: str
+
+
 @dataclass(frozen=True)
 class Node:
     name: str
     expression: exp.Expr
     source: exp.Expr
     downstream: list[Node] = field(default_factory=list)
+    control_downstream: list[Edge] = field(default_factory=list)
     source_name: str = ""
     reference_node_name: str = ""
 
     # Caller-injected per-node data, populated via the `on_node` hook on lineage()
     payload: dict[str, t.Any] = field(default_factory=dict)
 
-    def walk(self) -> Iterator[Node]:
+    def walk(self, control: bool = False) -> Iterator[Node]:
         visited: set[int] = set()
         queue = [self]
         while queue:
@@ -43,12 +65,16 @@ class Node:
             visited.add(node_id)
             yield node
             queue.extend(reversed(node.downstream))
+            if control:
+                queue.extend(edge.node for edge in node.control_downstream)
 
-    def to_html(self, dialect: DialectType = None, **opts: Unpack[GraphHTMLArgs]) -> GraphHTML:
+    def to_html(
+        self, dialect: DialectType = None, control: bool = False, **opts: Unpack[GraphHTMLArgs]
+    ) -> GraphHTML:
         nodes = {}
         edges = []
 
-        for node in self.walk():
+        for node in self.walk(control=control):
             if isinstance(node.expression, exp.Table):
                 label = f"FROM {node.expression.this}"
                 title = f"<pre>SELECT {node.name} FROM {node.expression.this}</pre>"
@@ -75,6 +101,16 @@ class Node:
 
             for d in node.downstream:
                 edges.append({"from": node_id, "to": id(d)})
+            if control:
+                for edge in node.control_downstream:
+                    edges.append(
+                        {
+                            "from": node_id,
+                            "to": id(edge.node),
+                            "label": edge.kind,
+                            "dashes": True,
+                        }
+                    )
         return GraphHTML(nodes, edges, **opts)
 
 
@@ -95,6 +131,7 @@ def lineage(
     scope: Scope | None = None,
     trim_selects: bool = True,
     copy: bool = True,
+    control: bool = False,
     on_node: t.Callable[[Node], None] | None = None,
     **kwargs,
 ) -> Node | dict[str, Node]:
@@ -113,6 +150,10 @@ def lineage(
         scope: A pre-created scope to use instead.
         trim_selects: Whether to clean up selects by trimming to only relevant columns.
         copy: Whether to copy the Expr arguments.
+        control: Whether to also compute control dependencies (columns from WHERE,
+            JOIN ON, HAVING, QUALIFY, GROUP BY and CASE conditions that decide whether
+            a row appears in the result). These are exposed as typed Edge objects on
+            Node.control_downstream, keeping Node.downstream purely value-based.
         on_node: Optional callback invoked for every Node created during the walk,
             after the Node's downstream is populated. Useful for injecting
             caller-managed data into Node.payload during the walk.
@@ -154,6 +195,7 @@ def lineage(
 
     cache: dict[tuple, Node] = {}
     scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] = {}
+    control_guard: set[int] = set()
 
     if column is not None:
         column_name = normalize_identifiers.normalize_identifiers(column, dialect=dialect).name
@@ -165,9 +207,11 @@ def lineage(
             scope,
             dialect,
             trim_selects=trim_selects,
+            control=control,
             schema=schema,
             _cache=cache,
             _scope_meta=scope_meta,
+            _control_guard=control_guard,
             on_node=on_node,
         )
 
@@ -184,9 +228,11 @@ def lineage(
             scope,
             dialect,
             trim_selects=trim_selects,
+            control=control,
             schema=schema,
             _cache=cache,
             _scope_meta=scope_meta,
+            _control_guard=control_guard,
             on_node=on_node,
         )
 
@@ -202,9 +248,11 @@ def to_node(
     source_name: str | None = None,
     reference_node_name: str | None = None,
     trim_selects: bool = True,
+    control: bool = False,
     schema: Schema | None = None,
     _cache: dict[tuple, Node] | None = None,
     _scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] | None = None,
+    _control_guard: set[int] | None = None,
     on_node: t.Callable[[Node], None] | None = None,
 ) -> Node:
     cache_key = (column, id(scope), scope_name, source_name, reference_node_name)
@@ -254,9 +302,11 @@ def to_node(
                 source_name=source_name,
                 reference_node_name=reference_node_name,
                 trim_selects=trim_selects,
+                control=control,
                 schema=schema,
                 _cache=_cache,
                 _scope_meta=_scope_meta,
+                _control_guard=_control_guard,
                 on_node=on_node,
             )
             # Skip caching a passed-in upstream returned by an inner SetOp:
@@ -295,9 +345,11 @@ def to_node(
                 source_name=source_name,
                 reference_node_name=reference_node_name,
                 trim_selects=trim_selects,
+                control=control,
                 schema=schema,
                 _cache=_cache,
                 _scope_meta=_scope_meta,
+                _control_guard=_control_guard,
                 on_node=on_node,
             )
 
@@ -345,9 +397,11 @@ def to_node(
                 dialect=dialect,
                 upstream=node,
                 trim_selects=trim_selects,
+                control=control,
                 schema=schema,
                 _cache=_cache,
                 _scope_meta=_scope_meta,
+                _control_guard=_control_guard,
                 on_node=on_node,
             )
 
@@ -414,9 +468,11 @@ def to_node(
                 source_name=source_names.get(table) or source_name,
                 reference_node_name=reference_node_name,
                 trim_selects=trim_selects,
+                control=control,
                 schema=schema,
                 _cache=_cache,
                 _scope_meta=_scope_meta,
+                _control_guard=_control_guard,
                 on_node=on_node,
             )
         elif pivots and pivots[-1].alias_or_name == c.table:
@@ -462,9 +518,11 @@ def to_node(
                         source_name=source_names.get(table) or source_name,
                         reference_node_name=reference_node_name,
                         trim_selects=trim_selects,
+                        control=control,
                         schema=schema,
                         _cache=_cache,
                         _scope_meta=_scope_meta,
+                        _control_guard=_control_guard,
                         on_node=on_node,
                     )
                 else:
@@ -488,6 +546,28 @@ def to_node(
             if on_node:
                 on_node(leaf)
 
+    if control and isinstance(scope.expression, exp.Select):
+        if _control_guard is None:
+            _control_guard = set()
+        scope_id = id(scope)
+        if scope_id not in _control_guard:
+            # Guard against control conditions that (transitively) refer back to
+            # this scope, e.g. through a recursive CTE
+            _control_guard.add(scope_id)
+            _trace_control(
+                node,
+                scope,
+                select,
+                dialect,
+                trim_selects=trim_selects,
+                schema=schema,
+                _cache=_cache,
+                _scope_meta=_scope_meta,
+                _control_guard=_control_guard,
+                on_node=on_node,
+            )
+            _control_guard.discard(scope_id)
+
     if _cache is not None:
         _cache[cache_key] = node
 
@@ -495,6 +575,150 @@ def to_node(
         on_node(node)
 
     return node
+
+
+def _control_predicates(scope: Scope) -> Iterator[tuple[exp.Expr, str]]:
+    """Yield the (expression, edge kind) pairs of a scope that control row membership."""
+    expression = scope.expression
+    if not isinstance(expression, exp.Select):
+        return
+
+    where = expression.args.get("where")
+    if where:
+        yield where.this, EdgeKind.FILTER
+
+    for join in expression.args.get("joins") or []:
+        on = join.args.get("on")
+        if on:
+            yield on, EdgeKind.JOIN
+
+    having = expression.args.get("having")
+    if having:
+        yield having.this, EdgeKind.HAVING
+
+    qualify_ = expression.args.get("qualify")
+    if qualify_:
+        yield qualify_.this, EdgeKind.QUALIFY
+
+    group = expression.args.get("group")
+    if group:
+        for key in group.expressions:
+            yield key, EdgeKind.GROUP
+
+
+def _trace_control(
+    node: Node,
+    scope: Scope,
+    select: exp.Expr,
+    dialect: DialectType,
+    trim_selects: bool = True,
+    schema: Schema | None = None,
+    _cache: dict[tuple, Node] | None = None,
+    _scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] | None = None,
+    _control_guard: set[int] | None = None,
+    on_node: t.Callable[[Node], None] | None = None,
+) -> None:
+    """Attach typed control-dependency edges for a freshly created node."""
+    seen: set[tuple[str, str]] = set()
+    kwargs = dict(
+        dialect=dialect,
+        trim_selects=trim_selects,
+        schema=schema,
+        _cache=_cache,
+        _scope_meta=_scope_meta,
+        _control_guard=_control_guard,
+        on_node=on_node,
+    )
+
+    # CASE conditions in the projection decide which branch produces the value
+    for case in find_all_in_scope(select, exp.Case):
+        for if_ in case.args.get("ifs", []):
+            for column in find_all_in_scope(if_.this, exp.Column):
+                _add_control_edge(node, column, scope, EdgeKind.CASE, seen, **kwargs)
+
+    _trace_scope_control(node, scope, seen, **kwargs)
+
+
+def _trace_scope_control(
+    node: Node,
+    scope: Scope,
+    seen: set[tuple[str, str]],
+    **kwargs: t.Any,
+) -> None:
+    subquery_scopes = {
+        id(subquery_scope.expression): subquery_scope for subquery_scope in scope.subquery_scopes
+    }
+
+    for predicate, kind in _control_predicates(scope):
+        for column in find_all_in_scope(predicate, exp.Column):
+            _add_control_edge(node, column, scope, kind, seen, **kwargs)
+
+        # Conditions inside subqueries of the predicate (e.g. EXISTS, IN) also
+        # gate the row, so trace them against their own scope as well
+        for subquery in find_all_in_scope(predicate, *exp.UNWRAPPED_QUERIES):
+            subquery_scope = subquery_scopes.get(id(subquery))
+            if subquery_scope is not None:
+                _trace_scope_control(node, subquery_scope, seen, **kwargs)
+
+
+def _add_control_edge(
+    node: Node,
+    column: exp.Column,
+    scope: Scope,
+    kind: str,
+    seen: set[tuple[str, str]],
+    dialect: DialectType = None,
+    trim_selects: bool = True,
+    schema: Schema | None = None,
+    _cache: dict[tuple, Node] | None = None,
+    _scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] | None = None,
+    _control_guard: set[int] | None = None,
+    on_node: t.Callable[[Node], None] | None = None,
+) -> None:
+    key = (kind, column.sql(comments=False))
+    if key in seen:
+        return
+    seen.add(key)
+
+    target_scope = scope
+    col_source: exp.Table | Scope | None = scope.sources.get(column.table)
+
+    # Correlated columns reference an ancestor scope's source, not an inner one
+    while col_source is None and column.table and target_scope.parent is not None:
+        target_scope = target_scope.parent
+        col_source = target_scope.sources.get(column.table)
+
+    if isinstance(col_source, Scope):
+        reference_node_name = None
+        if col_source.scope_type == ScopeType.DERIVED_TABLE:
+            reference_node_name = column.table
+        elif col_source.scope_type == ScopeType.CTE:
+            selected_node, _ = target_scope.selected_sources.get(column.table, (None, None))
+            reference_node_name = selected_node.name if selected_node else None
+
+        target = to_node(
+            column.name,
+            scope=col_source,
+            dialect=dialect,
+            scope_name=column.table or None,
+            reference_node_name=reference_node_name,
+            trim_selects=trim_selects,
+            control=True,
+            schema=schema,
+            _cache=_cache,
+            _scope_meta=_scope_meta,
+            _control_guard=_control_guard,
+            on_node=on_node,
+        )
+    else:
+        # A physical table, or an unknown source (e.g. no schema / missing `sources`
+        # mapping): represent the unresolvable column as a placeholder leaf
+        col_expr = col_source or exp.Placeholder()
+        target = Node(name=column.sql(comments=False), source=col_expr, expression=col_expr)
+        if on_node:
+            on_node(target)
+
+    node.control_downstream.append(Edge(node=target, kind=kind))
 
 
 def _pre_pivot_columns(pivot: exp.Pivot, scope: Scope, schema: Schema | None = None) -> list[str]:

@@ -3,7 +3,8 @@ from __future__ import annotations
 import unittest
 
 import sqlglot
-from sqlglot.lineage import lineage
+from sqlglot import exp
+from sqlglot.lineage import EdgeKind, lineage
 from sqlglot.schema import MappingSchema
 
 
@@ -1299,3 +1300,137 @@ class TestLineage(unittest.TestCase):
                 seen.add(id(node))
         for nid in seen:
             self.assertEqual(counts.get(nid, 0), 1)
+
+    def test_control_dependencies_basic(self) -> None:
+        node = lineage("a", "SELECT a FROM t WHERE b > 0", control=True)
+
+        # value dependency: a comes from t.a
+        self.assertEqual([d.name for d in node.downstream], ["t.a"])
+
+        # control dependency: b decides whether the row appears
+        self.assertEqual(
+            [(e.kind, e.node.name) for e in node.control_downstream],
+            [(EdgeKind.FILTER, "t.b")],
+        )
+
+        # the default interface is unchanged: no control edges are computed
+        default = lineage("a", "SELECT a FROM t WHERE b > 0")
+        self.assertEqual(default.control_downstream, [])
+        self.assertEqual([d.name for d in default.downstream], ["t.a"])
+
+    def test_control_dependencies_cte_agg_case(self) -> None:
+        sql = """
+        WITH c AS (SELECT a, b FROM t)
+        SELECT c.a AS a, CASE WHEN c.b > 1 THEN 'x' ELSE 'y' END AS label, COUNT(*) AS n
+        FROM c JOIN u ON c.a = u.a
+        WHERE c.b > 0
+        GROUP BY c.a, c.b
+        HAVING SUM(c.b) > 10
+        """
+        node = lineage("label", sql, control=True)
+
+        kinds = {(e.kind, e.node.name) for e in node.control_downstream}
+        self.assertIn((EdgeKind.CASE, "c.b"), kinds)
+        self.assertIn((EdgeKind.FILTER, "c.b"), kinds)
+        self.assertIn((EdgeKind.JOIN, "c.a"), kinds)
+        self.assertIn((EdgeKind.JOIN, "u.a"), kinds)
+        self.assertIn((EdgeKind.GROUP, "c.a"), kinds)
+        self.assertIn((EdgeKind.GROUP, "c.b"), kinds)
+        self.assertIn((EdgeKind.HAVING, "c.b"), kinds)
+
+        # control conditions trace through the CTE to the correct input
+        filter_edge = next(e for e in node.control_downstream if e.kind == EdgeKind.FILTER)
+        self.assertEqual(filter_edge.node.downstream[0].name, "t.b")
+
+        # aggregates without column inputs still carry control dependencies
+        count_node = lineage("n", sql, control=True)
+        self.assertEqual(count_node.downstream, [])
+        self.assertTrue(count_node.control_downstream)
+
+    def test_control_dependencies_qualify(self) -> None:
+        node = lineage(
+            "a",
+            "SELECT a FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY b) = 1",
+            control=True,
+        )
+        kinds = {(e.kind, e.node.name) for e in node.control_downstream}
+        self.assertIn((EdgeKind.QUALIFY, "t.g"), kinds)
+        self.assertIn((EdgeKind.QUALIFY, "t.b"), kinds)
+
+    def test_control_dependencies_constant_output(self) -> None:
+        node = lineage("one", "SELECT 1 AS one FROM t WHERE b > 0", control=True)
+
+        # a constant has no value dependencies, but the row is still gated
+        self.assertEqual(node.downstream, [])
+        self.assertEqual(
+            [(e.kind, e.node.name) for e in node.control_downstream],
+            [(EdgeKind.FILTER, "t.b")],
+        )
+
+    def test_control_dependencies_unresolved_column(self) -> None:
+        # without a schema, `b` cannot be resolved to any source of the derived table
+        node = lineage(
+            "a",
+            "SELECT a FROM (SELECT a FROM x) AS t WHERE b > 0",
+            control=True,
+        )
+        self.assertEqual(len(node.control_downstream), 1)
+        edge = node.control_downstream[0]
+        self.assertEqual(edge.kind, EdgeKind.FILTER)
+        self.assertEqual(edge.node.name, "b")
+        self.assertIsInstance(edge.node.source, exp.Placeholder)
+
+    def test_control_dependencies_correlated_subquery(self) -> None:
+        node = lineage(
+            "a",
+            "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM s WHERE s.x = t.x AND s.y > 0)",
+            control=True,
+        )
+        edges = {(e.node.name, e.node.source.sql()) for e in node.control_downstream}
+
+        # the correlated column resolves to the outer table, not the inner one
+        self.assertIn(("t.x", "t AS t"), edges)
+        self.assertIn(("s.x", "s AS s"), edges)
+        self.assertIn(("s.y", "s AS s"), edges)
+
+    def test_control_dependencies_shared_nodes(self) -> None:
+        graphs = lineage(
+            None,
+            "WITH c AS (SELECT a, b FROM t) SELECT a AS x, a AS y FROM c WHERE b > 0",
+            control=True,
+        )
+
+        # both projections trace back to the same cached CTE node
+        self.assertIs(graphs["x"].downstream[0], graphs["y"].downstream[0])
+
+        # control targets are shared across output columns as well
+        self.assertIs(
+            graphs["x"].control_downstream[0].node,
+            graphs["y"].control_downstream[0].node,
+        )
+
+    def test_control_dependencies_recursive_cte(self) -> None:
+        node = lineage(
+            "n",
+            "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 5) "
+            "SELECT n FROM r",
+            control=True,
+        )
+
+        # the cyclic reference terminates and produces no self-loops
+        nodes = list(node.walk(control=True))
+        self.assertTrue(nodes)
+        for current in nodes:
+            self.assertNotIn(current, current.downstream)
+            self.assertNotIn(current, [e.node for e in current.control_downstream])
+
+    def test_control_dependencies_to_html(self) -> None:
+        node = lineage("a", "SELECT a FROM t WHERE b > 0", control=True)
+        graph_html = node.to_html(control=True)
+
+        kinds = {edge.get("label") for edge in graph_html.edges}
+        self.assertIn(EdgeKind.FILTER, kinds)
+
+        # without control=True the html output is unchanged
+        plain = node.to_html()
+        self.assertNotIn("label", {k for edge in plain.edges for k in edge})
