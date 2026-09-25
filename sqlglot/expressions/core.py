@@ -47,6 +47,26 @@ COLUMN_PARTS = ("this", "table", "db", "catalog")
 POSITION_META_KEYS: tuple[str, ...] = ("line", "col", "start", "end")
 UNITTEST: bool = "unittest" in sys.modules or "pytest" in sys.modules
 
+# Meta keys used to store a node's full source span when parsing with `source_spans=True`.
+# "span" holds half-open character offsets, "byte_span" the corresponding UTF-8 byte offsets.
+SOURCE_SPAN_META_KEYS: tuple[str, ...] = ("span", "byte_span")
+
+
+class SourceSpan(t.NamedTuple):
+    """
+    The half-open `[start, end)` source range of an expression, available for statements
+    parsed with `source_spans=True` (see `sqlglot.parser.Parser`).
+
+    `start`/`end` are character offsets into the original SQL string, so the corresponding
+    source text is `sql[span.start:span.end]`. `byte_start`/`byte_end` are the equivalent
+    UTF-8 byte offsets, i.e. `sql.encode("utf-8")[span.byte_start:span.byte_end]`.
+    """
+
+    start: int
+    end: int
+    byte_start: int
+    byte_end: int
+
 
 @trait
 class Expr:
@@ -244,12 +264,22 @@ class Expr:
     def meta_get(self, key: str, default: t.Any = None) -> t.Any:
         raise NotImplementedError
 
+    @property
+    def source_span(self) -> SourceSpan | None:
+        raise NotImplementedError
+
+    def source_slice(self, sql: str) -> str | None:
+        raise NotImplementedError
+
     def __deepcopy__(self, memo: t.Any) -> Expr:
         raise NotImplementedError
 
     def copy(self: E) -> E:
         """
         Returns a deep copy of the expression.
+
+        Note: source span metadata (see `source_span`) is preserved by copies, since a
+        copy still corresponds to the same range in the original SQL string.
         """
         raise NotImplementedError
 
@@ -999,6 +1029,59 @@ class Expression(Expr):
         meta = self._meta
         return meta.get(key, default) if meta is not None else default
 
+    @property
+    def source_span(self) -> SourceSpan | None:
+        """
+        The half-open `[start, end)` source range of this expression, or None if the
+        statement was not parsed with `source_spans=True` or no source tokens are
+        associated with this node (e.g. it was built programmatically).
+
+        A node's span is the smallest contiguous range covering the source tokens it
+        consists of. Ownership rules for tokens that don't belong to a leaf node:
+
+        - Parentheses are owned by the node whose grammar production they delimit:
+          function call parentheses belong to the function node, `OVER (...)` /
+          `FILTER (...)` parentheses to the window node, parentheses wrapping a
+          subquery or expression to that subquery/expression node, and parentheses
+          around a list of expressions (e.g. `IN (...)`) to the enclosing node.
+        - Keywords and punctuation between a node's tokens (e.g. `AS` in an alias,
+          commas in a function's argument list) are covered by the node's span.
+        - Comments are attached to nodes as metadata (`comments`) but don't extend
+          spans; comments located between a node's tokens are covered by its span.
+        - Statement separators (`;`) belong to no statement: each statement's span
+          excludes them.
+
+        Spans describe the tree as it was parsed. `copy` preserves them, but structural
+        mutations may invalidate them: `transform` drops spans from replaced nodes and
+        their ancestors, and `replace` drops spans from the replaced node's ancestors.
+
+        Example:
+            >>> import sqlglot
+            >>> sql = "SELECT MAX(x) FROM t"
+            >>> ast = sqlglot.parse_one(sql, source_spans=True)
+            >>> span = ast.find(sqlglot.exp.AggFunc).source_span
+            >>> sql[span.start:span.end]
+            'MAX(x)'
+        """
+        meta = self._meta
+        if meta is None:
+            return None
+
+        span = meta.get("span")
+        byte_span = meta.get("byte_span")
+        if span is None or byte_span is None:
+            return None
+
+        return SourceSpan(span[0], span[1], byte_span[0], byte_span[1])
+
+    def source_slice(self, sql: str) -> str | None:
+        """
+        Returns the slice of `sql` corresponding to this expression's `source_span`,
+        or None if the span is unknown.
+        """
+        span = self.source_span
+        return sql[span.start : span.end] if span is not None else None
+
     def __deepcopy__(self, memo: t.Any) -> Expr:
         root = self.__class__()
         stack: list[tuple[Expr, Expr]] = [(self, root)]
@@ -1253,12 +1336,36 @@ class Expression(Expr):
     def transform(
         self, fun: t.Callable[..., T], *args: object, copy: bool = True, **kwargs: object
     ) -> T:
+        """
+        Visits all tree nodes (excluding already transformed ones)
+        and applies the given transformation function to each node.
+
+        Source span metadata (see `source_span`) is preserved for untouched nodes, but
+        dropped from nodes replaced by `fun` (including their new subtrees) and from
+        their ancestors, since those ranges may no longer correspond to the source.
+
+        Args:
+            fun: a function which takes a node as an argument and returns a
+                new transformed node or the same node without modifications. If the function
+                returns None, then the corresponding node will be removed from the syntax tree.
+            copy: if set to True a new tree instance is constructed, otherwise the tree is
+                modified in place.
+
+        Returns:
+            The transformed tree.
+        """
         root: t.Any = None
         new_node: t.Any = None
 
         for node in (self.copy() if copy else self).dfs(prune=lambda n: n is not new_node):
             parent, arg_key, index = node.parent, node.arg_key, node.index
             new_node = fun(node, *args, **kwargs)
+
+            if new_node is not node:
+                if isinstance(new_node, Expr):
+                    _drop_source_spans(new_node)
+                if node.meta_get("span") is not None:
+                    _drop_source_spans(parent, ancestors_only=True)
 
             if not root:
                 root = new_node
@@ -1269,12 +1376,22 @@ class Expression(Expr):
         return root
 
     def replace(self, expression: T) -> T:
+        """
+        Swap out this expression with a new expression.
+
+        Source span metadata (see `source_span`) of this node's ancestors is dropped,
+        since their ranges may no longer correspond to the source. The replacement's
+        own metadata is left untouched.
+        """
         parent = self.parent
 
         if not parent or parent is expression:
             return expression
 
         key = self.arg_key
+
+        if self.meta_get("span") is not None:
+            _drop_source_spans(parent, ancestors_only=True)
 
         if key:
             value = parent.args.get(key)
@@ -2376,6 +2493,29 @@ def _lazy_unnest(**kwargs: object) -> Expr:
     from sqlglot.expressions.array import Unnest
 
     return Unnest(**kwargs)
+
+
+def _drop_source_spans(node: Expr | None, ancestors_only: bool = False) -> None:
+    """
+    Drops source span metadata (see `Expression.source_span`) from a node's subtree,
+    or - if `ancestors_only` is set - from the node and its ancestors.
+    """
+    if node is None:
+        return
+
+    if ancestors_only:
+        while node is not None:
+            meta = node._meta
+            if meta is not None:
+                for key in SOURCE_SPAN_META_KEYS:
+                    meta.pop(key, None)
+            node = node.parent
+    else:
+        for descendant in node.dfs():
+            meta = descendant._meta
+            if meta is not None:
+                for key in SOURCE_SPAN_META_KEYS:
+                    meta.pop(key, None)
 
 
 def convert(value: t.Any, copy: bool = False) -> Expr:

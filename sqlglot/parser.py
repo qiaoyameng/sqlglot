@@ -47,6 +47,16 @@ TEXTS_TYPE = t.Union[tuple[str, ...], list[str], t.AbstractSet[str], t.Mapping[s
 TIME_ZONE_RE: Pattern[str] = re.compile(r":.*?[a-zA-Z\+\-]")
 
 
+def _utf8_byte_offsets(sql: str) -> list[int]:
+    """Maps each character offset in `sql` to its corresponding UTF-8 byte offset."""
+    offsets = [0] * (len(sql) + 1)
+    total = 0
+    for i, char in enumerate(sql, 1):
+        total += len(char.encode("utf-8"))
+        offsets[i] = total
+    return offsets
+
+
 def build_var_map(args: BuilderArgs) -> exp.StarMap | exp.VarMap:
     if len(args) == 1 and args[0].is_star:
         return exp.StarMap(this=args[0])
@@ -349,6 +359,11 @@ class Parser:
             Default: 3
         max_nodes: Maximum number of AST nodes to prevent memory exhaustion.
             Set to -1 (default) to disable the check.
+        source_spans: Whether to compute the full source span of every expression and
+            store it in its metadata (see `sqlglot.expressions.Expression.source_span`).
+            When disabled (default), no span metadata is produced and parsed expressions
+            don't retain any reference to the source SQL string.
+            Default: False
     """
 
     __slots__ = (
@@ -356,6 +371,7 @@ class Parser:
         "error_message_context",
         "max_errors",
         "max_nodes",
+        "source_spans",
         "dialect",
         "sql",
         "errors",
@@ -365,6 +381,7 @@ class Parser:
         "_next",
         "_prev",
         "_prev_comments",
+        "_pending_paren_tokens",
         "_pipe_cte_counter",
         "_chunks",
         "_chunk_index",
@@ -1960,11 +1977,13 @@ class Parser:
         max_errors: int = 3,
         max_nodes: int = -1,
         dialect: DialectType = None,
+        source_spans: bool = False,
     ):
         self.error_level: ErrorLevel = error_level or ErrorLevel.IMMEDIATE
         self.error_message_context: int = error_message_context
         self.max_errors: int = max_errors
         self.max_nodes: int = max_nodes
+        self.source_spans: bool = source_spans
         self.dialect: t.Any = _resolve_dialect(dialect)
         self.sql: str = ""
         self.errors: list[ParseError] = []
@@ -1975,6 +1994,7 @@ class Parser:
         self._next: Token = SENTINEL_NONE
         self._prev: Token = SENTINEL_NONE
         self._prev_comments: list[str] = []
+        self._pending_paren_tokens: tuple[Token, Token] | None = None
         self._pipe_cte_counter: int = 0
         self._chunks: list[list[Token]] = []
         self._chunk_index: i64 = 0
@@ -1990,6 +2010,7 @@ class Parser:
         self._next = SENTINEL_NONE
         self._prev = SENTINEL_NONE
         self._prev_comments = []
+        self._pending_paren_tokens = None
         self._pipe_cte_counter = 0
         self._chunks = []
         self._chunk_index = 0
@@ -2033,6 +2054,8 @@ class Parser:
         if self._curr.token_type == token_type:
             if advance:
                 self._advance()
+                if expression is not None:
+                    self._own_source_token(expression, self._prev)
             self._add_comments(expression)
             return True
         return False
@@ -2209,9 +2232,32 @@ class Parser:
         if token:
             instance.update_positions(token)
         instance.add_comments(comments) if comments else self._add_comments(instance)
+        if self._pending_paren_tokens is not None:
+            l_paren, r_paren = self._pending_paren_tokens
+            self._pending_paren_tokens = None
+            self._own_source_token(instance, l_paren)
+            self._own_source_token(instance, r_paren)
         if not instance.is_primitive:
             instance = self.validate_expression(instance)
         return instance
+
+    def _own_source_token(self, expression: exp.Expr | None, token: Token | None) -> None:
+        """
+        Assigns ownership of a token's source range to an expression, extending its
+        source span accordingly. Only active when parsing with `source_spans=True`.
+        """
+        if not self.source_spans or expression is None or token is None:
+            return
+
+        meta = expression.meta
+        span = meta.get("span")
+        start, end = token.start, token.end + 1
+
+        if span:
+            start = min(start, span[0])
+            end = max(end, span[1])
+
+        meta["span"] = (start, end)
 
     def _parse_batch_statements(
         self,
@@ -2224,6 +2270,7 @@ class Parser:
         if sep_first_statement:
             self._match(TokenType.BEGIN)
             expressions.append(parse_method(self))
+            self._pending_paren_tokens = None
 
         chunks_length = len(self._chunks)
         while self._chunk_index < chunks_length:
@@ -2236,7 +2283,17 @@ class Parser:
                 expressions.append(exp.EndStatement())
                 continue
 
-            expressions.append(parse_method(self))
+            chunk_tokens = self._tokens
+            expression = parse_method(self)
+
+            # The statement owns its chunk's leading token (e.g. INSERT, CREATE), so
+            # that its source span covers the whole statement. Separating semicolons
+            # are not part of any chunk and thus belong to no statement.
+            if expression is not None and chunk_tokens:
+                self._own_source_token(expression, chunk_tokens[0])
+
+            expressions.append(expression)
+            self._pending_paren_tokens = None
 
             if self._index < self._tokens_size:
                 self.raise_error("Invalid expression / Unexpected token")
@@ -2269,7 +2326,53 @@ class Parser:
 
         self._chunks = chunks
 
-        return self._parse_batch_statements(parse_method=parse_method, sep_first_statement=False)
+        expressions = self._parse_batch_statements(
+            parse_method=parse_method, sep_first_statement=False
+        )
+
+        if self.source_spans and self.sql:
+            byte_offsets = _utf8_byte_offsets(self.sql)
+            for expression in expressions:
+                if expression is not None:
+                    self._assign_source_spans(expression, byte_offsets)
+
+        return expressions
+
+    def _assign_source_spans(self, expression: exp.Expr, byte_offsets: list[int]) -> None:
+        """
+        Computes the full source span of every node in the tree as the smallest
+        contiguous range covering the source tokens the node consists of, storing
+        half-open character offsets under meta["span"] and the corresponding UTF-8
+        byte offsets under meta["byte_span"] (see `Expression.source_span`).
+        """
+        # reversed pre-order DFS processes every descendant before its ancestors
+        for node in reversed(list(expression.dfs())):
+            start: int | None = None
+            end: int | None = None
+
+            meta = node._meta
+            if meta:
+                span = meta.get("span")
+                if span:
+                    start, end = span
+
+                token_start = meta.get("start")
+                token_end = meta.get("end")
+                if token_start is not None and token_end is not None:
+                    token_end += 1  # token positions are inclusive, spans are half-open
+                    start = token_start if start is None else min(start, token_start)
+                    end = token_end if end is None else max(end, token_end)
+
+            for child in node.iter_expressions():
+                child_span = child.meta_get("span")
+                if child_span:
+                    start = child_span[0] if start is None else min(start, child_span[0])
+                    end = child_span[1] if end is None else max(end, child_span[1])
+
+            if start is not None:
+                meta = node.meta
+                meta["span"] = (start, end)
+                meta["byte_span"] = (byte_offsets[start], byte_offsets[end])
 
     def _warn_unsupported(self) -> None:
         if self._tokens_size <= 1:
@@ -3953,9 +4056,13 @@ class Parser:
             return self._parse_expression()
 
         if self._match(TokenType.L_PAREN):
+            l_paren = self._prev
             expressions = self._parse_csv(_parse_value_expression)
             self._match_r_paren()
-            return self.expression(exp.Tuple(expressions=expressions))
+            tuple_ = self.expression(exp.Tuple(expressions=expressions))
+            self._own_source_token(tuple_, l_paren)
+            self._own_source_token(tuple_, self._prev)
+            return tuple_
 
         # In some dialects we can have VALUES 1, 2 which results in 1 column & 2 rows.
         expression = self._parse_expression()
@@ -4066,6 +4173,7 @@ class Parser:
         )
 
         if self._match(TokenType.SELECT):
+            select_token = self._prev
             comments = self._prev_comments
 
             hint = self._parse_hint()
@@ -4128,6 +4236,7 @@ class Parser:
                     operation_modifiers=operation_modifiers or None,
                 )
             )
+            self._own_source_token(this, select_token)
             this.comments = comments
 
             into = self._parse_into()
@@ -4142,6 +4251,7 @@ class Parser:
 
             this = self._parse_query_modifiers(this)
         elif (table or nested) and self._match(TokenType.L_PAREN):
+            l_paren = self._prev
             comments = self._prev_comments
             this = self._parse_wrapped_select(table=table)
 
@@ -4151,7 +4261,14 @@ class Parser:
             # We return early here so that the UNION isn't attached to the subquery by the
             # following call to _parse_set_operations, but instead becomes the parent node
             self._match_r_paren()
-            return self._parse_subquery(this, parse_alias=parse_subquery_alias)
+            r_paren = self._prev
+            subquery = self._parse_subquery(this, parse_alias=parse_subquery_alias)
+
+            if subquery:
+                self._own_source_token(subquery, l_paren)
+                self._own_source_token(subquery, r_paren)
+
+            return subquery
         elif self._match(TokenType.VALUES, advance=False):
             this = self._parse_derived_table_values()
         elif from_:
@@ -4188,8 +4305,12 @@ class Parser:
         )
 
     def _parse_with(self, skip_with_token: bool = False) -> exp.With | None:
-        if not skip_with_token and not self._match(TokenType.WITH):
-            return None
+        if not skip_with_token:
+            if not self._match(TokenType.WITH):
+                return None
+            with_token = self._prev
+        else:
+            with_token = None
 
         comments = self._prev_comments
         recursive = self._match(TokenType.RECURSIVE)
@@ -4216,7 +4337,7 @@ class Parser:
 
             last_comments = self._prev_comments
 
-        return self.expression(
+        this = self.expression(
             exp.With(
                 expressions=expressions,
                 recursive=recursive or None,
@@ -4225,6 +4346,8 @@ class Parser:
             ),
             comments=comments,
         )
+        self._own_source_token(this, with_token)
+        return this
 
     def _parse_cte(self) -> exp.CTE | exp.FunctionSpecification | None:
         index = self._index
@@ -7123,6 +7246,7 @@ class Parser:
         if not self._match(TokenType.L_PAREN):
             return None
 
+        l_paren = self._prev
         comments = self._prev_comments
         query = self._parse_select()
 
@@ -7149,6 +7273,7 @@ class Parser:
 
         if this:
             this.add_comments(comments)
+            self._own_source_token(this, l_paren)
 
         self._match_r_paren(expression=this)
 
@@ -7551,6 +7676,8 @@ class Parser:
         if not self._match(TokenType.L_PAREN):
             return this
 
+        l_paren = self._prev
+
         # Disambiguate between schema and subquery/CTE, e.g. in INSERT INTO table (<expr>),
         # expr can be of both types
         if self._match_set(self.SELECT_START_TOKENS):
@@ -7558,7 +7685,10 @@ class Parser:
             return this
         args = self._parse_csv(lambda: self._parse_constraint() or self._parse_field_def())
         self._match_r_paren()
-        return self.expression(exp.Schema(this=this, expressions=args))
+        schema = self.expression(exp.Schema(this=this, expressions=args))
+        self._own_source_token(schema, l_paren)
+        self._own_source_token(schema, self._prev)
+        return schema
 
     def _parse_field_def(self) -> exp.Expr | None:
         return self._parse_column_def(self._parse_field(any_token=True))
@@ -8094,6 +8224,7 @@ class Parser:
         ifs = []
         default = None
 
+        case_token = self._prev
         comments = self._prev_comments
         expression = self._parse_disjunction()
 
@@ -8106,15 +8237,21 @@ class Parser:
         if self._match(TokenType.ELSE):
             default = self._parse_disjunction()
 
-        if not self._match(TokenType.END):
-            if isinstance(default, exp.Interval) and default.this.sql().upper() == "END":
-                default = exp.column("interval")
-            else:
-                self.raise_error("Expected END after CASE", self._prev)
+        if self._match(TokenType.END):
+            end_token = self._prev
+        elif isinstance(default, exp.Interval) and default.this.sql().upper() == "END":
+            default = exp.column("interval")
+            end_token = None
+        else:
+            self.raise_error("Expected END after CASE", self._prev)
+            end_token = None
 
-        return self.expression(
+        case = self.expression(
             exp.Case(this=expression, ifs=ifs, default=default), comments=comments
         )
+        self._own_source_token(case, case_token)
+        self._own_source_token(case, end_token)
+        return case
 
     def _parse_if(self) -> exp.Expr | None:
         if self._match(TokenType.L_PAREN):
@@ -8697,6 +8834,7 @@ class Parser:
                 exp.Filter(this=this, expression=self._parse_where(skip_where_token=True))
             )
             self._match_r_paren()
+            self._own_source_token(this, self._prev)
 
         # SQL spec defines an optional [ { IGNORE | RESPECT } NULLS ] OVER
         # Some dialects choose to implement and some do not.
@@ -8774,6 +8912,7 @@ class Parser:
             spec = None
 
         self._match_r_paren()
+        r_paren = self._prev
 
         window = self.expression(
             exp.Window(
@@ -8787,6 +8926,7 @@ class Parser:
             ),
             comments=comments,
         )
+        self._own_source_token(window, r_paren)
 
         # This covers Oracle's FIRST/LAST syntax: aggregate KEEP (...) OVER (...)
         if self._match_set(self.WINDOW_BEFORE_PAREN_TOKENS, advance=False):
@@ -8986,11 +9126,20 @@ class Parser:
 
     def _parse_wrapped(self, parse_method: t.Callable[[], T], optional: bool = False) -> T:
         wrapped = self._match(TokenType.L_PAREN)
+        l_paren = self._prev if wrapped else None
         if not wrapped and not optional:
             self.raise_error("Expecting (")
         parse_result = parse_method()
         if wrapped:
             self._match_r_paren()
+            if self.source_spans:
+                if isinstance(parse_result, exp.Expr):
+                    self._own_source_token(parse_result, l_paren)
+                    self._own_source_token(parse_result, self._prev)
+                elif isinstance(parse_result, list) and parse_result:
+                    # The list's parentheses are owned by the enclosing node, which
+                    # doesn't exist yet - defer ownership to the next `expression` call.
+                    self._pending_paren_tokens = (l_paren, self._prev)
         return parse_result
 
     def _parse_expressions(self) -> list[exp.Expr]:

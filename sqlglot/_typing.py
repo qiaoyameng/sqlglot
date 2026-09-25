@@ -30,6 +30,7 @@ class ParserNoDialectArgs(t.TypedDict, total=False):
     error_message_context: int
     max_errors: int
     max_nodes: int
+    source_spans: bool
 
 
 class DataTypeArgs(ParserNoDialectArgs, total=False):
