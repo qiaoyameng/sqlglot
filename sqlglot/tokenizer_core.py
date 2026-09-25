@@ -480,7 +480,7 @@ class Token:
         "end",
         "comments",
     )
-    __slots__ = _attrs
+    __slots__ = _attrs + ("comment_ranges",)
 
     @classmethod
     def number(cls, number: int) -> Token:
@@ -511,6 +511,7 @@ class Token:
         start: int = 0,
         end: int = 0,
         comments: list[str] | None = None,
+        comment_ranges: list[tuple[int, int]] | None = None,
     ) -> None:
         self.token_type = token_type
         self.text = text
@@ -519,6 +520,8 @@ class Token:
         self.start = start
         self.end = end
         self.comments = [] if comments is None else comments
+        # Half-open char ranges of the attached comments within the source string
+        self.comment_ranges = [] if comment_ranges is None else comment_ranges
 
     def __bool__(self) -> bool:
         return self.token_type != TokenType.SENTINEL
@@ -543,6 +546,7 @@ class TokenizerCore:
         "_line",
         "_col",
         "_comments",
+        "_comment_ranges",
         "_char",
         "_end",
         "_peek",
@@ -641,6 +645,7 @@ class TokenizerCore:
         self._line = 1
         self._col = 0
         self._comments: list[str] = []
+        self._comment_ranges: list[tuple[int, int]] = []
         self._char = ""
         self._end = False
         self._peek = ""
@@ -655,6 +660,7 @@ class TokenizerCore:
         self._line = 1
         self._col = 0
         self._comments = []
+        self._comment_ranges = []
         self._char = ""
         self._end = False
         self._peek = ""
@@ -710,6 +716,7 @@ class TokenizerCore:
 
         if self.tokens and self._comments:
             self.tokens[-1].comments.extend(self._comments)
+            self.tokens[-1].comment_ranges.extend(self._comment_ranges)
 
     def _chars(self, size: int) -> str:
         if size == 1:
@@ -766,7 +773,9 @@ class TokenizerCore:
 
         if self._comments and token_type == TokenType.SEMICOLON and self.tokens:
             self.tokens[-1].comments.extend(self._comments)
+            self.tokens[-1].comment_ranges.extend(self._comment_ranges)
             self._comments = []
+            self._comment_ranges = []
 
         if text is None:
             text = self.sql[self._start : self._current]
@@ -780,9 +789,11 @@ class TokenizerCore:
                 start=self._start,
                 end=self._current - 1,
                 comments=self._comments,
+                comment_ranges=self._comment_ranges,
             )
         )
         self._comments = []
+        self._comment_ranges = []
 
         # If we have either a semicolon or a begin token before the command's token, we'll parse
         # whatever follows the command's token as a string
@@ -863,6 +874,7 @@ class TokenizerCore:
         if comment_start not in self.comments:
             return False
 
+        comment_offset = self._start
         comment_start_line = self._line
         comment_start_size = len(comment_start)
         comment_end = self.comments[comment_start]
@@ -901,6 +913,8 @@ class TokenizerCore:
                 _peek = self._peek
             self._comments.append(self._text[comment_start_size:])
 
+        self._comment_ranges.append((comment_offset, self._current))
+
         if (
             comment_start == self.hint_start
             and self.tokens
@@ -912,7 +926,9 @@ class TokenizerCore:
         # Multiple consecutive comments are preserved by appending them to the current comments list.
         if comment_start_line == self._prev_token_line:
             self.tokens[-1].comments.extend(self._comments)
+            self.tokens[-1].comment_ranges.extend(self._comment_ranges)
             self._comments = []
+            self._comment_ranges = []
             self._prev_token_line = self._line
 
         return True

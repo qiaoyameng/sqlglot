@@ -21,6 +21,7 @@ from sqlglot.errors import (
 from sqlglot.expressions import apply_index_offset
 from sqlglot.helper import ensure_list, i64, seq_get
 from sqlglot.optimizer.scope import find_in_scope
+from sqlglot.spans import SPAN_END_META_KEY, assign_statement_spans, utf8_byte_offsets
 from sqlglot.time import format_time
 from sqlglot.tokens import Token, Tokenizer, TokenType
 from sqlglot.trie import TrieResult, in_trie, new_trie
@@ -349,6 +350,10 @@ class Parser:
             Default: 3
         max_nodes: Maximum number of AST nodes to prevent memory exhaustion.
             Set to -1 (default) to disable the check.
+        source_spans: Whether to annotate every parsed expression with a `SourceSpan`
+            (half-open char and UTF-8 byte offsets into the source SQL), exposed via
+            `Expression.source_span`. Only offsets are stored, never the source text.
+            Default: False
     """
 
     __slots__ = (
@@ -370,6 +375,8 @@ class Parser:
         "_chunk_index",
         "_tokens_size",
         "_node_count",
+        "source_spans",
+        "_byte_offsets",
     )
 
     FUNCTIONS: t.ClassVar[dict[str, t.Callable]] = {
@@ -1960,11 +1967,13 @@ class Parser:
         max_errors: int = 3,
         max_nodes: int = -1,
         dialect: DialectType = None,
+        source_spans: bool = False,
     ):
         self.error_level: ErrorLevel = error_level or ErrorLevel.IMMEDIATE
         self.error_message_context: int = error_message_context
         self.max_errors: int = max_errors
         self.max_nodes: int = max_nodes
+        self.source_spans: bool = source_spans
         self.dialect: t.Any = _resolve_dialect(dialect)
         self.sql: str = ""
         self.errors: list[ParseError] = []
@@ -1979,6 +1988,7 @@ class Parser:
         self._chunks: list[list[Token]] = []
         self._chunk_index: i64 = 0
         self._node_count: int = 0
+        self._byte_offsets: list[int] = []
 
     def reset(self) -> None:
         self.sql = ""
@@ -1994,6 +2004,7 @@ class Parser:
         self._chunks = []
         self._chunk_index = 0
         self._node_count = 0
+        self._byte_offsets = []
 
     def _advance(self, times: i64 = 1) -> None:
         index = self._index + times
@@ -2211,7 +2222,16 @@ class Parser:
         instance.add_comments(comments) if comments else self._add_comments(instance)
         if not instance.is_primitive:
             instance = self.validate_expression(instance)
+        if self.source_spans and self._prev:
+            # Records the offset of the last consumed token, so that the span assignment
+            # can anchor keyword-only tails (e.g. CURRENT ROW) of this expression
+            instance.meta[SPAN_END_META_KEY] = self._prev.end
         return instance
+
+    def _assign_source_spans(self, expression: exp.Expr | None) -> None:
+        if expression is not None and self.source_spans:
+            tokens = [t for t in self._tokens if t.token_type != TokenType.SEMICOLON]
+            assign_statement_spans(expression, tokens, self._byte_offsets)
 
     def _parse_batch_statements(
         self,
@@ -2224,6 +2244,7 @@ class Parser:
         if sep_first_statement:
             self._match(TokenType.BEGIN)
             expressions.append(parse_method(self))
+            self._assign_source_spans(expressions[-1])
 
         chunks_length = len(self._chunks)
         while self._chunk_index < chunks_length:
@@ -2237,6 +2258,7 @@ class Parser:
                 continue
 
             expressions.append(parse_method(self))
+            self._assign_source_spans(expressions[-1])
 
             if self._index < self._tokens_size:
                 self.raise_error("Invalid expression / Unexpected token")
@@ -2253,6 +2275,9 @@ class Parser:
     ) -> list[exp.Expr | None]:
         self.reset()
         self.sql = sql or ""
+
+        if self.source_spans:
+            self._byte_offsets = utf8_byte_offsets(self.sql)
 
         total = len(raw_tokens)
         chunks: list[list[Token]] = [[]]

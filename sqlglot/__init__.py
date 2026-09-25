@@ -24,6 +24,7 @@ from sqlglot.errors import (
 )
 from sqlglot.expressions import (
     Expr as Expr,
+    SourceSpan as SourceSpan,
     alias_ as alias,
     and_ as and_,
     case as case,

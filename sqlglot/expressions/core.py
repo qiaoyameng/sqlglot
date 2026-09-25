@@ -48,6 +48,34 @@ POSITION_META_KEYS: tuple[str, ...] = ("line", "col", "start", "end")
 UNITTEST: bool = "unittest" in sys.modules or "pytest" in sys.modules
 
 
+class SourceSpan(t.NamedTuple):
+    """
+    A half-open source range of a parsed expression.
+
+    Spans are only assigned when parsing with ``source_spans=True``. They are stored as
+    plain offsets, so no reference to the source text is retained on the AST.
+
+    Attributes:
+        start: inclusive character offset into the source SQL string.
+        end: exclusive character offset into the source SQL string.
+        byte_start: inclusive offset into the UTF-8 encoding of the source SQL string.
+        byte_end: exclusive offset into the UTF-8 encoding of the source SQL string.
+    """
+
+    start: int
+    end: int
+    byte_start: int
+    byte_end: int
+
+    def slice(self, sql: str) -> str:
+        """Returns the source text of this span, i.e. ``sql[start:end]``."""
+        return sql[self.start : self.end]
+
+    def slice_bytes(self, data: bytes) -> bytes:
+        """Returns the UTF-8 encoded source bytes of this span."""
+        return data[self.byte_start : self.byte_end]
+
+
 @trait
 class Expr:
     """
@@ -998,6 +1026,27 @@ class Expression(Expr):
         """Reads a meta value without allocating the meta dict (unlike the `meta` property)."""
         meta = self._meta
         return meta.get(key, default) if meta is not None else default
+
+    @property
+    def source_span(self) -> SourceSpan | None:
+        """
+        The half-open source range this expression was parsed from, or None if unknown.
+
+        Spans are assigned only when parsing with ``source_spans=True``, e.g.
+        ``sqlglot.parse_one(sql, source_spans=True)``. They always refer to the original
+        parsed text and are never recomputed after the tree is mutated:
+
+        - ``copy()``/``deepcopy()`` preserve the span, since the copy denotes the same
+          source text. Subsequent mutations do not update it.
+        - ``transform()``/``replace()`` never fabricate spans: newly created nodes have
+          no span, while untouched nodes keep theirs.
+        - ``update_positions()`` does not transfer spans between expressions.
+        """
+        span = self.meta_get("span")
+        if span is None or isinstance(span, SourceSpan):
+            return span
+        # Tolerate spans that went through serde (tuples deserialize as lists)
+        return SourceSpan(*span)
 
     def __deepcopy__(self, memo: t.Any) -> Expr:
         root = self.__class__()
