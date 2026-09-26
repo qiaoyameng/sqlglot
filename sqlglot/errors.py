@@ -93,6 +93,10 @@ class OptimizeError(SqlglotError):
     pass
 
 
+class TenantFilterError(OptimizeError):
+    """Raised when a tenant filter cannot be applied safely to a query."""
+
+
 class SchemaError(SqlglotError):
     pass
 
